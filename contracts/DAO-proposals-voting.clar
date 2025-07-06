@@ -208,3 +208,87 @@
   (map-set member-voting-power CONTRACT-OWNER u100)
   (var-set member-counter u1)
 )
+
+
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u201))
+(define-constant ERR-INVALID-DELEGATION (err u202))
+
+(define-data-var dao-contract (optional principal) none)
+
+(define-map delegations principal principal)
+(define-map delegation-power principal uint)
+(define-map member-power principal uint)
+
+(define-public (set-dao-contract (new-dao principal))
+  (begin
+    (asserts! (is-eq tx-sender (as-contract tx-sender)) ERR-NOT-AUTHORIZED)
+    (var-set dao-contract (some new-dao))
+    (ok true)
+  )
+)
+
+(define-public (set-member-power (member principal) (power uint))
+  (begin
+    (asserts! (is-some (var-get dao-contract)) ERR-NOT-AUTHORIZED)
+    (map-set member-power member power)
+    (ok true)
+  )
+)
+
+(define-public (delegate-votes (delegate-to principal))
+  (let
+    (
+      (delegator-power (default-to u0 (map-get? member-power tx-sender)))
+    )
+    (asserts! (> delegator-power u0) ERR-NOT-MEMBER)
+    (asserts! (> (default-to u0 (map-get? member-power delegate-to)) u0) ERR-NOT-MEMBER)
+    (asserts! (not (is-eq tx-sender delegate-to)) ERR-CANNOT-DELEGATE-TO-SELF)
+    
+    (match (map-get? delegations tx-sender)
+      previous-delegate 
+      (map-set delegation-power previous-delegate 
+        (- (default-to u0 (map-get? delegation-power previous-delegate)) delegator-power))
+      true
+    )
+    
+    (map-set delegations tx-sender delegate-to)
+    (map-set delegation-power delegate-to 
+      (+ (default-to u0 (map-get? delegation-power delegate-to)) delegator-power))
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation)
+  (let
+    (
+      (delegator-power (default-to u0 (map-get? member-power tx-sender)))
+      (current-delegate (unwrap! (map-get? delegations tx-sender) ERR-INVALID-DELEGATION))
+    )
+    (map-delete delegations tx-sender)
+    (map-set delegation-power current-delegate 
+      (- (default-to u0 (map-get? delegation-power current-delegate)) delegator-power))
+    (ok true)
+  )
+)
+
+(define-read-only (get-delegation (delegator principal))
+  (map-get? delegations delegator)
+)
+
+(define-read-only (get-total-voting-power (member principal))
+  (let
+    (
+      (base-power (default-to u0 (map-get? member-power member)))
+      (delegated-power (default-to u0 (map-get? delegation-power member)))
+    )
+    (+ base-power delegated-power)
+  )
+)
+
+(define-read-only (get-delegated-power (delegate principal))
+  (default-to u0 (map-get? delegation-power delegate))
+)
+
+(define-read-only (has-delegation (delegator principal))
+  (is-some (map-get? delegations delegator))
+)
