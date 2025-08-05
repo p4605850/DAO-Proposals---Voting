@@ -6,6 +6,8 @@
 (define-constant ERR-NOT-MEMBER (err u105))
 (define-constant ERR-INVALID-VOTING-PERIOD (err u106))
 (define-constant ERR-PROPOSAL-EXECUTED (err u107))
+(define-constant ERR-QUORUM-NOT-MET (err u108))
+(define-constant ERR-INVALID-QUORUM (err u109))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MIN-VOTING-PERIOD u144)
@@ -13,6 +15,8 @@
 
 (define-data-var proposal-counter uint u0)
 (define-data-var member-counter uint u0)
+(define-data-var quorum-percentage uint u50)
+(define-data-var total-voting-power uint u0)
 
 (define-map members principal bool)
 (define-map member-voting-power principal uint)
@@ -45,16 +49,21 @@
     (map-set members member true)
     (map-set member-voting-power member voting-power)
     (var-set member-counter (+ (var-get member-counter) u1))
+    (var-set total-voting-power (+ (var-get total-voting-power) voting-power))
     (ok true)
   )
 )
 
 (define-public (remove-member (member principal))
-  (begin
+  (let
+    (
+      (member-power (default-to u0 (map-get? member-voting-power member)))
+    )
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
     (map-delete members member)
     (map-delete member-voting-power member)
     (var-set member-counter (- (var-get member-counter) u1))
+    (var-set total-voting-power (- (var-get total-voting-power) member-power))
     (ok true)
   )
 )
@@ -120,9 +129,12 @@
   (let
     (
       (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+      (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+      (required-quorum (/ (* (var-get total-voting-power) (var-get quorum-percentage)) u100))
     )
     (asserts! (> stacks-block-height (get end-block proposal)) ERR-VOTING-ACTIVE)
     (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXECUTED)
+    (asserts! (>= total-votes required-quorum) ERR-QUORUM-NOT-MET)
     
     (let
       (
@@ -137,11 +149,24 @@
 )
 
 (define-public (update-voting-power (member principal) (new-power uint))
-  (begin
+  (let
+    (
+      (old-power (default-to u0 (map-get? member-voting-power member)))
+    )
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
     (asserts! (is-member member) ERR-NOT-MEMBER)
     (asserts! (> new-power u0) ERR-NOT-AUTHORIZED)
     (map-set member-voting-power member new-power)
+    (var-set total-voting-power (+ (- (var-get total-voting-power) old-power) new-power))
+    (ok true)
+  )
+)
+
+(define-public (set-quorum-percentage (new-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (and (> new-percentage u0) (<= new-percentage u100)) ERR-INVALID-QUORUM)
+    (var-set quorum-percentage new-percentage)
     (ok true)
   )
 )
@@ -193,13 +218,36 @@
   )
 )
 
+(define-read-only (get-quorum-info (proposal-id uint))
+  (match (map-get? proposals proposal-id)
+    proposal
+    (let
+      (
+        (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+        (required-quorum (/ (* (var-get total-voting-power) (var-get quorum-percentage)) u100))
+      )
+      (some {
+        total-votes: total-votes,
+        required-quorum: required-quorum,
+        quorum-met: (>= total-votes required-quorum),
+        participation-rate: (if (> (var-get total-voting-power) u0)
+                             (/ (* total-votes u100) (var-get total-voting-power))
+                             u0)
+      })
+    )
+    none
+  )
+)
+
 (define-read-only (get-contract-info)
   {
     owner: CONTRACT-OWNER,
     total-proposals: (var-get proposal-counter),
     total-members: (var-get member-counter),
     min-voting-period: MIN-VOTING-PERIOD,
-    max-voting-period: MAX-VOTING-PERIOD
+    max-voting-period: MAX-VOTING-PERIOD,
+    quorum-percentage: (var-get quorum-percentage),
+    total-voting-power: (var-get total-voting-power)
   }
 )
 
@@ -207,88 +255,7 @@
   (map-set members CONTRACT-OWNER true)
   (map-set member-voting-power CONTRACT-OWNER u100)
   (var-set member-counter u1)
+  (var-set total-voting-power u100)
 )
 
 
-(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u201))
-(define-constant ERR-INVALID-DELEGATION (err u202))
-
-(define-data-var dao-contract (optional principal) none)
-
-(define-map delegations principal principal)
-(define-map delegation-power principal uint)
-(define-map member-power principal uint)
-
-(define-public (set-dao-contract (new-dao principal))
-  (begin
-    (asserts! (is-eq tx-sender (as-contract tx-sender)) ERR-NOT-AUTHORIZED)
-    (var-set dao-contract (some new-dao))
-    (ok true)
-  )
-)
-
-(define-public (set-member-power (member principal) (power uint))
-  (begin
-    (asserts! (is-some (var-get dao-contract)) ERR-NOT-AUTHORIZED)
-    (map-set member-power member power)
-    (ok true)
-  )
-)
-
-(define-public (delegate-votes (delegate-to principal))
-  (let
-    (
-      (delegator-power (default-to u0 (map-get? member-power tx-sender)))
-    )
-    (asserts! (> delegator-power u0) ERR-NOT-MEMBER)
-    (asserts! (> (default-to u0 (map-get? member-power delegate-to)) u0) ERR-NOT-MEMBER)
-    (asserts! (not (is-eq tx-sender delegate-to)) ERR-CANNOT-DELEGATE-TO-SELF)
-    
-    (match (map-get? delegations tx-sender)
-      previous-delegate 
-      (map-set delegation-power previous-delegate 
-        (- (default-to u0 (map-get? delegation-power previous-delegate)) delegator-power))
-      true
-    )
-    
-    (map-set delegations tx-sender delegate-to)
-    (map-set delegation-power delegate-to 
-      (+ (default-to u0 (map-get? delegation-power delegate-to)) delegator-power))
-    (ok true)
-  )
-)
-
-(define-public (revoke-delegation)
-  (let
-    (
-      (delegator-power (default-to u0 (map-get? member-power tx-sender)))
-      (current-delegate (unwrap! (map-get? delegations tx-sender) ERR-INVALID-DELEGATION))
-    )
-    (map-delete delegations tx-sender)
-    (map-set delegation-power current-delegate 
-      (- (default-to u0 (map-get? delegation-power current-delegate)) delegator-power))
-    (ok true)
-  )
-)
-
-(define-read-only (get-delegation (delegator principal))
-  (map-get? delegations delegator)
-)
-
-(define-read-only (get-total-voting-power (member principal))
-  (let
-    (
-      (base-power (default-to u0 (map-get? member-power member)))
-      (delegated-power (default-to u0 (map-get? delegation-power member)))
-    )
-    (+ base-power delegated-power)
-  )
-)
-
-(define-read-only (get-delegated-power (delegate principal))
-  (default-to u0 (map-get? delegation-power delegate))
-)
-
-(define-read-only (has-delegation (delegator principal))
-  (is-some (map-get? delegations delegator))
-)
