@@ -257,5 +257,3 @@
   (var-set member-counter u1)
   (var-set total-voting-power u100)
 )
-
-
