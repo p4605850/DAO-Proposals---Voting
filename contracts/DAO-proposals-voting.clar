@@ -8,6 +8,9 @@
 (define-constant ERR-PROPOSAL-EXECUTED (err u107))
 (define-constant ERR-QUORUM-NOT-MET (err u108))
 (define-constant ERR-INVALID-QUORUM (err u109))
+(define-constant ERR-INSUFFICIENT-FEE (err u110))
+(define-constant ERR-INVALID-FEE (err u111))
+(define-constant ERR-REFUND-FAILED (err u112))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MIN-VOTING-PERIOD u144)
@@ -17,6 +20,8 @@
 (define-data-var member-counter uint u0)
 (define-data-var quorum-percentage uint u50)
 (define-data-var total-voting-power uint u0)
+(define-data-var proposal-fee uint u1000000)
+(define-data-var treasury-balance uint u0)
 
 (define-map members principal bool)
 (define-map member-voting-power principal uint)
@@ -33,7 +38,9 @@
     yes-votes: uint,
     no-votes: uint,
     executed: bool,
-    passed: bool
+    passed: bool,
+    fee-paid: uint,
+    fee-refunded: bool
   }
 )
 
@@ -77,9 +84,14 @@
       (proposal-id (+ (var-get proposal-counter) u1))
       (start-block stacks-block-height)
       (end-block (+ stacks-block-height voting-period))
+      (fee-amount (var-get proposal-fee))
     )
     (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
     (asserts! (and (>= voting-period MIN-VOTING-PERIOD) (<= voting-period MAX-VOTING-PERIOD)) ERR-INVALID-VOTING-PERIOD)
+    (asserts! (>= (stx-get-balance tx-sender) fee-amount) ERR-INSUFFICIENT-FEE)
+    
+    (try! (stx-transfer? fee-amount tx-sender (as-contract tx-sender)))
+    (var-set treasury-balance (+ (var-get treasury-balance) fee-amount))
     
     (map-set proposals proposal-id
       {
@@ -92,7 +104,9 @@
         yes-votes: u0,
         no-votes: u0,
         executed: false,
-        passed: false
+        passed: false,
+        fee-paid: fee-amount,
+        fee-refunded: false
       }
     )
     (var-set proposal-counter proposal-id)
@@ -131,20 +145,42 @@
       (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
       (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
       (required-quorum (/ (* (var-get total-voting-power) (var-get quorum-percentage)) u100))
+      (passed (> (get yes-votes proposal) (get no-votes proposal)))
     )
     (asserts! (> stacks-block-height (get end-block proposal)) ERR-VOTING-ACTIVE)
     (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXECUTED)
     (asserts! (>= total-votes required-quorum) ERR-QUORUM-NOT-MET)
     
-    (let
-      (
-        (passed (> (get yes-votes proposal) (get no-votes proposal)))
-      )
-      (map-set proposals proposal-id
-        (merge proposal { executed: true, passed: passed })
+    (map-set proposals proposal-id
+      (merge proposal { executed: true, passed: passed })
+    )
+    
+    (if (and passed (not (get fee-refunded proposal)))
+      (begin
+        (try! (refund-proposal-fee proposal-id))
+        (ok passed)
       )
       (ok passed)
     )
+  )
+)
+
+(define-public (refund-proposal-fee (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+      (fee-amount (get fee-paid proposal))
+      (proposer (get proposer proposal))
+    )
+    (asserts! (get executed proposal) ERR-PROPOSAL-EXECUTED)
+    (asserts! (get passed proposal) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get fee-refunded proposal)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (var-get treasury-balance) fee-amount) ERR-INSUFFICIENT-FEE)
+    
+    (try! (as-contract (stx-transfer? fee-amount (as-contract tx-sender) proposer)))
+    (var-set treasury-balance (- (var-get treasury-balance) fee-amount))
+    (map-set proposals proposal-id (merge proposal { fee-refunded: true }))
+    (ok true)
   )
 )
 
@@ -167,6 +203,25 @@
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
     (asserts! (and (> new-percentage u0) (<= new-percentage u100)) ERR-INVALID-QUORUM)
     (var-set quorum-percentage new-percentage)
+    (ok true)
+  )
+)
+
+(define-public (set-proposal-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> new-fee u0) ERR-INVALID-FEE)
+    (var-set proposal-fee new-fee)
+    (ok true)
+  )
+)
+
+(define-public (withdraw-treasury (amount uint) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (<= amount (var-get treasury-balance)) ERR-INSUFFICIENT-FEE)
+    (try! (as-contract (stx-transfer? amount (as-contract tx-sender) recipient)))
+    (var-set treasury-balance (- (var-get treasury-balance) amount))
     (ok true)
   )
 )
@@ -239,6 +294,26 @@
   )
 )
 
+(define-read-only (get-fee-info (proposal-id uint))
+  (match (map-get? proposals proposal-id)
+    proposal
+    (some {
+      fee-paid: (get fee-paid proposal),
+      fee-refunded: (get fee-refunded proposal),
+      can-refund: (and (get executed proposal) (get passed proposal) (not (get fee-refunded proposal)))
+    })
+    none
+  )
+)
+
+(define-read-only (get-treasury-info)
+  {
+    current-fee: (var-get proposal-fee),
+    treasury-balance: (var-get treasury-balance),
+    contract-balance: (stx-get-balance (as-contract tx-sender))
+  }
+)
+
 (define-read-only (get-contract-info)
   {
     owner: CONTRACT-OWNER,
@@ -247,7 +322,9 @@
     min-voting-period: MIN-VOTING-PERIOD,
     max-voting-period: MAX-VOTING-PERIOD,
     quorum-percentage: (var-get quorum-percentage),
-    total-voting-power: (var-get total-voting-power)
+    total-voting-power: (var-get total-voting-power),
+    proposal-fee: (var-get proposal-fee),
+    treasury-balance: (var-get treasury-balance)
   }
 )
 
