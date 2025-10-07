@@ -11,6 +11,8 @@
 (define-constant ERR-INSUFFICIENT-FEE (err u110))
 (define-constant ERR-INVALID-FEE (err u111))
 (define-constant ERR-REFUND-FAILED (err u112))
+(define-constant ERR-PROPOSAL-CANCELLED (err u113))
+(define-constant ERR-ALREADY-CANCELLED (err u114))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MIN-VOTING-PERIOD u144)
@@ -40,7 +42,9 @@
     executed: bool,
     passed: bool,
     fee-paid: uint,
-    fee-refunded: bool
+    fee-refunded: bool,
+    cancelled: bool,
+    cancelled-at-block: uint
   }
 )
 
@@ -106,7 +110,9 @@
         executed: false,
         passed: false,
         fee-paid: fee-amount,
-        fee-refunded: false
+        fee-refunded: false,
+        cancelled: false,
+        cancelled-at-block: u0
       }
     )
     (var-set proposal-counter proposal-id)
@@ -122,6 +128,7 @@
       (vote-key { proposal-id: proposal-id, voter: tx-sender })
     )
     (asserts! (is-member tx-sender) ERR-NOT-MEMBER)
+    (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
     (asserts! (<= stacks-block-height (get end-block proposal)) ERR-VOTING-ENDED)
     (asserts! (is-none (map-get? votes vote-key)) ERR-ALREADY-VOTED)
     
@@ -147,6 +154,7 @@
       (required-quorum (/ (* (var-get total-voting-power) (var-get quorum-percentage)) u100))
       (passed (> (get yes-votes proposal) (get no-votes proposal)))
     )
+    (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
     (asserts! (> stacks-block-height (get end-block proposal)) ERR-VOTING-ACTIVE)
     (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXECUTED)
     (asserts! (>= total-votes required-quorum) ERR-QUORUM-NOT-MET)
@@ -226,6 +234,31 @@
   )
 )
 
+(define-public (cancel-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+      (fee-amount (get fee-paid proposal))
+    )
+    (asserts! (is-eq tx-sender (get proposer proposal)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXECUTED)
+    (asserts! (not (get cancelled proposal)) ERR-ALREADY-CANCELLED)
+    (asserts! (>= (var-get treasury-balance) fee-amount) ERR-INSUFFICIENT-FEE)
+    
+    (try! (as-contract (stx-transfer? fee-amount (as-contract tx-sender) (get proposer proposal))))
+    (var-set treasury-balance (- (var-get treasury-balance) fee-amount))
+    
+    (map-set proposals proposal-id 
+      (merge proposal { 
+        cancelled: true, 
+        cancelled-at-block: stacks-block-height,
+        fee-refunded: true 
+      })
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-proposal (proposal-id uint))
   (map-get? proposals proposal-id)
 )
@@ -252,7 +285,17 @@
 
 (define-read-only (is-voting-active (proposal-id uint))
   (match (map-get? proposals proposal-id)
-    proposal (<= stacks-block-height (get end-block proposal))
+    proposal (and 
+      (<= stacks-block-height (get end-block proposal))
+      (not (get cancelled proposal))
+      (not (get executed proposal)))
+    false
+  )
+)
+
+(define-read-only (is-proposal-cancelled (proposal-id uint))
+  (match (map-get? proposals proposal-id)
+    proposal (get cancelled proposal)
     false
   )
 )
@@ -261,13 +304,31 @@
   (match (map-get? proposals proposal-id)
     proposal
     (some {
-      voting-active: (<= stacks-block-height (get end-block proposal)),
+      voting-active: (and 
+        (<= stacks-block-height (get end-block proposal))
+        (not (get cancelled proposal))
+        (not (get executed proposal))),
       total-votes: (+ (get yes-votes proposal) (get no-votes proposal)),
       yes-percentage: (if (> (+ (get yes-votes proposal) (get no-votes proposal)) u0)
                         (/ (* (get yes-votes proposal) u100) (+ (get yes-votes proposal) (get no-votes proposal)))
                         u0),
       executed: (get executed proposal),
-      passed: (get passed proposal)
+      passed: (get passed proposal),
+      cancelled: (get cancelled proposal)
+    })
+    none
+  )
+)
+
+(define-read-only (get-cancellation-info (proposal-id uint))
+  (match (map-get? proposals proposal-id)
+    proposal
+    (some {
+      cancelled: (get cancelled proposal),
+      cancelled-at-block: (get cancelled-at-block proposal),
+      can-cancel: (and 
+        (not (get executed proposal))
+        (not (get cancelled proposal)))
     })
     none
   )
