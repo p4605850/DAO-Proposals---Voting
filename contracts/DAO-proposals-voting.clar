@@ -14,6 +14,9 @@
 (define-constant ERR-PROPOSAL-CANCELLED (err u113))
 (define-constant ERR-ALREADY-CANCELLED (err u114))
 
+(define-constant ERR-EXTENSION-NOT-AUTHORIZED (err u115))
+(define-constant ERR-INVALID-EXTENSION (err u116))
+
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MIN-VOTING-PERIOD u144)
 (define-constant MAX-VOTING-PERIOD u4320)
@@ -44,7 +47,8 @@
     fee-paid: uint,
     fee-refunded: bool,
     cancelled: bool,
-    cancelled-at-block: uint
+    cancelled-at-block: uint,
+    extensions: uint
   }
 )
 
@@ -112,7 +116,8 @@
         fee-paid: fee-amount,
         fee-refunded: false,
         cancelled: false,
-        cancelled-at-block: u0
+        cancelled-at-block: u0,
+        extensions: u0
       }
     )
     (var-set proposal-counter proposal-id)
@@ -141,6 +146,30 @@
       (map-set proposals proposal-id
         (merge proposal { no-votes: (+ (get no-votes proposal) voter-power) })
       )
+    )
+    (ok true)
+  )
+)
+
+(define-public (extend-voting-period (proposal-id uint) (extension uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+      (proposer (get proposer proposal))
+      (current-end (get end-block proposal))
+      (start (get start-block proposal))
+      (current-length (- current-end start))
+      (new-length (+ current-length extension))
+      (new-end (+ current-end extension))
+    )
+    (asserts! (is-eq tx-sender proposer) ERR-EXTENSION-NOT-AUTHORIZED)
+    (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
+    (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXECUTED)
+    (asserts! (> extension u0) ERR-INVALID-EXTENSION)
+    (asserts! (<= new-length MAX-VOTING-PERIOD) ERR-INVALID-VOTING-PERIOD)
+    (asserts! (<= stacks-block-height current-end) ERR-VOTING-ENDED)
+    (map-set proposals proposal-id
+      (merge proposal { end-block: new-end, extensions: (+ (get extensions proposal) u1) })
     )
     (ok true)
   )
